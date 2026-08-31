@@ -46,31 +46,153 @@ async function removeFromIndex(env, apiKey) {
 }
 
 // ===========================================================================
-// Proxy relay — pure passthrough to Bedrock OpenAI-compatible endpoint
+// Auth helper
 // ===========================================================================
 
-async function proxyRelay(request, env) {
+async function validateKey(request, env) {
   const apiKey = request.headers.get("x-api-key")
     || request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim()
     || new URL(request.url).searchParams.get("apiKey");
-
   if (!apiKey) return json({ error: "Missing X-Api-Key header or apiKey param" }, 401);
-
   const record = await getKey(env, apiKey);
   if (!record) return json({ error: "Invalid API key" }, 403);
   if (new Date(record.expiresAt) < new Date()) {
     await deleteKey(env, apiKey);
     return json({ error: "API key expired" }, 403);
   }
+  return null;
+}
+
+// ===========================================================================
+// Translation helpers: Anthropic Messages API ↔ OpenAI chat.completions
+// ===========================================================================
+
+function anthropicToOpenAI(body, model) {
+  const { messages = [], system, max_tokens, stream, temperature, top_p } = body;
+
+  const openaiMessages = [];
+  if (system) {
+    const text = Array.isArray(system) ? system.map(b => b.text || "").join("") : system;
+    openaiMessages.push({ role: "system", content: text });
+  }
+  for (const msg of messages) {
+    const content = Array.isArray(msg.content)
+      ? msg.content.map(b => b.text || "").join("")
+      : (msg.content || "");
+    openaiMessages.push({ role: msg.role, content });
+  }
+
+  const out = { model, messages: openaiMessages };
+  if (max_tokens) out.max_tokens = max_tokens;
+  if (temperature !== undefined) out.temperature = temperature;
+  if (top_p !== undefined) out.top_p = top_p;
+  if (stream) { out.stream = true; out.stream_options = { include_usage: true }; }
+  return out;
+}
+
+function openaiToAnthropic(openaiBody, model) {
+  const choice = openaiBody.choices?.[0];
+  const usage = openaiBody.usage || {};
+  return {
+    id: openaiBody.id || ("msg_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24)),
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: choice?.message?.content || "" }],
+    model,
+    stop_reason: choice?.finish_reason === "length" ? "max_tokens" : "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0 },
+  };
+}
+
+// Reads OpenAI SSE stream, emits Anthropic SSE stream — text lines only, no binary parsing
+function openaiSSEToAnthropicSSE(upstreamBody, model) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  const emit = async (obj) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+
+  (async () => {
+    let buf = "";
+    let started = false;
+    let stopped = false;
+    let outputTokens = 0;
+
+    try {
+      const reader = upstreamBody.pipeThrough(new TextDecoderStream()).getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += value;
+        const lines = buf.split("\n");
+        buf = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+
+          if (raw === "[DONE]") {
+            if (!stopped) {
+              stopped = true;
+              await emit({ type: "content_block_stop", index: 0 });
+              await emit({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } });
+              await emit({ type: "message_stop" });
+            }
+            continue;
+          }
+
+          let chunk;
+          try { chunk = JSON.parse(raw); } catch { continue; }
+
+          // usage-only chunk (from stream_options.include_usage)
+          if (chunk.usage) {
+            outputTokens = chunk.usage.completion_tokens || 0;
+          }
+
+          const choice = chunk.choices?.[0];
+          if (!choice) continue;
+
+          if (!started) {
+            started = true;
+            await emit({ type: "message_start", message: { id: chunk.id, type: "message", role: "assistant", content: [], model, usage: { input_tokens: 0, output_tokens: 0 } } });
+            await emit({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+            await emit({ type: "ping" });
+          }
+
+          const text = choice.delta?.content;
+          if (text) await emit({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+
+          if (choice.finish_reason && !stopped) {
+            stopped = true;
+            const stopReason = choice.finish_reason === "length" ? "max_tokens" : "end_turn";
+            await emit({ type: "content_block_stop", index: 0 });
+            await emit({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } });
+            await emit({ type: "message_stop" });
+          }
+        }
+      }
+    } catch {}
+    finally { await writer.close(); }
+  })();
+
+  return readable;
+}
+
+// ===========================================================================
+// /v1/chat/completions — pure OpenAI passthrough
+// ===========================================================================
+
+async function proxyRelay(request, env) {
+  const err = await validateKey(request, env);
+  if (err) return err;
 
   const region = env.AWS_REGION || "us-east-1";
-  const allowedModel = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6-v1:0";
+  const model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
 
-  // Override model to enforce allowlist — response stream is still pure passthrough
   let body;
   try {
     const parsed = await request.json();
-    parsed.model = allowedModel;
+    parsed.model = model;
     body = JSON.stringify(parsed);
   } catch {
     return json({ error: "Invalid JSON body" }, 400);
@@ -80,22 +202,59 @@ async function proxyRelay(request, env) {
     `https://bedrock-runtime.${region}.amazonaws.com/openai/v1/chat/completions`,
     {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`,
-        "Content-Type": "application/json",
-      },
+      headers: { "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`, "Content-Type": "application/json" },
       body,
     }
   );
 
   return new Response(upstream.body, {
     status: upstream.status,
-    headers: {
-      "Content-Type": upstream.headers.get("Content-Type") || "application/json",
-      "Cache-Control": "no-cache",
-      ...corsHeaders,
-    },
+    headers: { "Content-Type": upstream.headers.get("Content-Type") || "application/json", "Cache-Control": "no-cache", ...corsHeaders },
   });
+}
+
+// ===========================================================================
+// /v1/messages — Anthropic SDK clients, translates to/from OpenAI on the wire
+// ===========================================================================
+
+async function messagesRelay(request, env) {
+  const err = await validateKey(request, env);
+  if (err) return err;
+
+  const region = env.AWS_REGION || "us-east-1";
+  const model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
+
+  let anthropicBody;
+  try { anthropicBody = await request.json(); }
+  catch { return json({ error: "Invalid JSON body" }, 400); }
+
+  const isStream = anthropicBody.stream === true;
+  const openaiBody = anthropicToOpenAI(anthropicBody, model);
+
+  const upstream = await fetch(
+    `https://bedrock-runtime.${region}.amazonaws.com/openai/v1/chat/completions`,
+    {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`, "Content-Type": "application/json" },
+      body: JSON.stringify(openaiBody),
+    }
+  );
+
+  if (!upstream.ok) {
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: { "Content-Type": "application/json", ...corsHeaders },
+    });
+  }
+
+  if (isStream) {
+    return new Response(openaiSSEToAnthropicSSE(upstream.body, model), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders },
+    });
+  }
+
+  return json(openaiToAnthropic(await upstream.json(), model));
 }
 
 // ===========================================================================
@@ -139,7 +298,7 @@ async function handleAdmin(request, env, adminSecret) {
       apiKey,
       expiresAt: record.expiresAt,
       name,
-      usage: `curl -X POST https://${request.headers.get("host")}/v1/chat/completions -H "x-api-key: ${apiKey}" -H "Content-Type: application/json" -d '{...}'`
+      usage: `curl -X POST https://${request.headers.get("host")}/v1/messages -H "x-api-key: ${apiKey}" -H "Content-Type: application/json" -d '{...}'`
     }, 201);
   }
 
@@ -166,6 +325,10 @@ export async function onRequest(context) {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
+  if (path === "/v1/messages" && request.method === "POST") {
+    return messagesRelay(request, env);
+  }
+
   if (path === "/v1/chat/completions" && request.method === "POST") {
     return proxyRelay(request, env);
   }
@@ -173,7 +336,7 @@ export async function onRequest(context) {
   if (path === "/v1/models" && request.method === "GET") {
     return json({
       object: "list",
-      data: [{ id: "us.anthropic.claude-sonnet-4-6-v1:0", object: "model", created: 1700000000, owned_by: "anthropic" }],
+      data: [{ id: "us.anthropic.claude-sonnet-4-6", object: "model", created: 1700000000, owned_by: "anthropic" }],
     });
   }
 
