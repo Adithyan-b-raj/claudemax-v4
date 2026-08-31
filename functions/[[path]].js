@@ -75,8 +75,10 @@ function transformBodyForBedrock(rawBody) {
     return { body: null, error: `Model "${parsed.model}" not allowed. Only Claude Sonnet 4.6 is supported.` };
   }
 
+  // Remove fields not supported by Bedrock
   delete parsed.model;
   delete parsed.stream;
+  delete parsed.context_management;
   parsed.anthropic_version = "bedrock-2023-05-31";
   return { body: JSON.stringify(parsed), error: null };
 }
