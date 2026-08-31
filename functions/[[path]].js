@@ -192,7 +192,8 @@ async function proxyRelay(request, env) {
   let body;
   try {
     const parsed = await request.json();
-    parsed.model = model;
+    // use client-supplied model for testing, fall back to env
+    parsed.model = parsed.model || model;
     body = JSON.stringify(parsed);
   } catch {
     return json({ error: "Invalid JSON body" }, 400);
