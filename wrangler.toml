@@ -9,4 +9,4 @@ id = "bb311e32cefa4a40ab5899f77ce580cc"
 
 [vars]
 AWS_REGION = "us-east-1"
-ANTHROPIC_MODEL = "anthropic.claude-sonnet-4-6-20250514-v1:0"
+ANTHROPIC_MODEL = "us.anthropic.claude-sonnet-4-6"
