@@ -1,0 +1,2 @@
+ADMIN_SECRET=your-admin-secret-here
+AWS_BEARER_TOKEN_BEDROCK=your-aws-bearer-token
