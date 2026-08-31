@@ -76,6 +76,7 @@ function transformBodyForBedrock(rawBody) {
   }
 
   delete parsed.model;
+  delete parsed.stream;
   parsed.anthropic_version = "bedrock-2023-05-31";
   return { body: JSON.stringify(parsed), error: null };
 }
