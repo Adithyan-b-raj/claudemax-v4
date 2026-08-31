@@ -1,8 +1,3 @@
-// ===========================================================================
-// Simple Bedrock Proxy — Cloudflare Pages Function (KV-backed)
-// Pure passthrough to AWS Bedrock. No token tracking.
-// ===========================================================================
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
@@ -17,7 +12,7 @@ function json(body, status = 200) {
 }
 
 // ===========================================================================
-// KV Data Layer — simple key storage
+// KV Data Layer
 // ===========================================================================
 
 async function getKey(env, apiKey) {
@@ -51,89 +46,7 @@ async function removeFromIndex(env, apiKey) {
 }
 
 // ===========================================================================
-// Bedrock helpers
-// ===========================================================================
-
-const ALLOWED_MODELS = [
-  "claude-sonnet-4-6",
-  "claude-sonnet-4-6-20250514",
-  "us.anthropic.claude-sonnet-4-6",
-  "anthropic.claude-sonnet-4-6",
-];
-
-function isModelAllowed(model) {
-  if (!model) return true;
-  const normalized = model.toLowerCase();
-  return ALLOWED_MODELS.some(m => normalized.includes(m.toLowerCase()));
-}
-
-function transformBodyForBedrock(rawBody) {
-  let parsed;
-  try { parsed = JSON.parse(rawBody); } catch { return { body: rawBody, error: null }; }
-
-  if (parsed.model && !isModelAllowed(parsed.model)) {
-    return { body: null, error: `Model "${parsed.model}" not allowed. Only Claude Sonnet 4.6 is supported.` };
-  }
-
-  // Remove fields not supported by Bedrock
-  delete parsed.model;
-  delete parsed.stream;
-  delete parsed.context_management;
-  parsed.anthropic_version = "bedrock-2023-05-31";
-  return { body: JSON.stringify(parsed), error: null };
-}
-
-function parseEventHeaders(buf) {
-  const headers = {};
-  const dv = new DataView(buf.buffer, buf.byteOffset);
-  let i = 0;
-  while (i < buf.length) {
-    const nameLen = buf[i++];
-    const name = new TextDecoder().decode(buf.slice(i, i + nameLen)); i += nameLen;
-    i++;
-    const valLen = dv.getUint16(i, false); i += 2;
-    const value = new TextDecoder().decode(buf.slice(i, i + valLen)); i += valLen;
-    headers[name] = value;
-  }
-  return headers;
-}
-
-function readEventFrame(accumulated) {
-  if (accumulated.length < 12) return null;
-  const dv = new DataView(accumulated.buffer, accumulated.byteOffset);
-  const totalLen = dv.getUint32(0, false);
-  if (accumulated.length < totalLen) return null;
-  const headersLen = dv.getUint32(4, false);
-  const headersEnd = 12 + headersLen;
-  const payloadEnd = totalLen - 4;
-  const headers = parseEventHeaders(accumulated.slice(12, headersEnd));
-  const payload = new TextDecoder().decode(accumulated.slice(headersEnd, payloadEnd));
-  return { headers, payload, consumed: totalLen };
-}
-
-function normalizeBedRockError(body) {
-  try {
-    const parsed = JSON.parse(body);
-    if (parsed.__type) {
-      const typeMap = {
-        "ValidationException": "invalid_request_error",
-        "ThrottlingException": "rate_limit_error",
-        "ModelNotReadyException": "api_error",
-        "ModelStreamErrorException": "api_error",
-        "AccessDeniedException": "authentication_error",
-        "ResourceNotFoundException": "not_found_error",
-      };
-      return JSON.stringify({
-        type: "error",
-        error: { type: typeMap[parsed.__type] || "api_error", message: parsed.message || parsed.__type },
-      });
-    }
-  } catch { }
-  return body;
-}
-
-// ===========================================================================
-// Proxy relay — forwards to AWS Bedrock
+// Proxy relay — pure passthrough to Bedrock OpenAI-compatible endpoint
 // ===========================================================================
 
 async function proxyRelay(request, env) {
@@ -141,117 +54,48 @@ async function proxyRelay(request, env) {
     || request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim()
     || new URL(request.url).searchParams.get("apiKey");
 
-  if (!apiKey) {
-    return json({ error: "Missing X-Api-Key header or apiKey param" }, 401);
-  }
+  if (!apiKey) return json({ error: "Missing X-Api-Key header or apiKey param" }, 401);
 
   const record = await getKey(env, apiKey);
-  if (!record) {
-    return json({ error: "Invalid API key" }, 403);
-  }
+  if (!record) return json({ error: "Invalid API key" }, 403);
   if (new Date(record.expiresAt) < new Date()) {
     await deleteKey(env, apiKey);
     return json({ error: "API key expired" }, 403);
   }
 
-  const rawBody = await request.text();
-  let isStream = false;
-  try { isStream = JSON.parse(rawBody).stream === true; } catch { }
-
-  const { body: bedrockBody, error: modelError } = transformBodyForBedrock(rawBody);
-  if (modelError) {
-    return json({ error: modelError }, 400);
-  }
-
   const region = env.AWS_REGION || "us-east-1";
-  const model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
-  const bedrockBase = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(model)}`;
-  const invokeUrl = isStream
-    ? `${bedrockBase}/invoke-with-response-stream`
-    : `${bedrockBase}/invoke`;
+  const allowedModel = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6-v1:0";
 
-  const upstream = await fetch(invokeUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`,
-    },
-    body: bedrockBody,
-  });
+  // Override model to enforce allowlist — response stream is still pure passthrough
+  let body;
+  try {
+    const parsed = await request.json();
+    parsed.model = allowedModel;
+    body = JSON.stringify(parsed);
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
 
-  // --- Streaming: Bedrock binary event stream → SSE ---
-  if (isStream && upstream.body) {
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-    const reader = upstream.body.getReader();
-    let accumulated = new Uint8Array(0);
-
-    (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const next = new Uint8Array(accumulated.length + value.length);
-          next.set(accumulated);
-          next.set(value, accumulated.length);
-          accumulated = next;
-
-          while (true) {
-            const frame = readEventFrame(accumulated);
-            if (!frame) break;
-            accumulated = accumulated.slice(frame.consumed);
-
-            const eventType = frame.headers[":event-type"];
-
-            if (eventType === "modelStreamErrorException") {
-              try {
-                const err = JSON.parse(frame.payload);
-                const errEvent = JSON.stringify({
-                  type: "error",
-                  error: { type: "api_error", message: err.message || "Bedrock stream error" },
-                });
-                await writer.write(encoder.encode(`data: ${errEvent}\n\n`));
-              } catch { }
-              break;
-            }
-
-            if (eventType === "chunk") {
-              try {
-                const wrapper = JSON.parse(frame.payload);
-                const anthropicJson = atob(wrapper.bytes);
-                await writer.write(encoder.encode(`data: ${anthropicJson}\n\n`));
-              } catch { }
-            }
-          }
-        }
-      } catch { }
-      finally { await writer.close(); }
-    })();
-
-    return new Response(readable, {
-      status: 200,
+  const upstream = await fetch(
+    `https://bedrock-runtime.${region}.amazonaws.com/openai/v1/chat/completions`,
+    {
+      method: "POST",
       headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        ...corsHeaders,
+        "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`,
+        "Content-Type": "application/json",
       },
-    });
-  }
+      body,
+    }
+  );
 
-  // --- Non-streaming ---
-  const respBody = await upstream.text();
-  const outBody = upstream.ok ? respBody : normalizeBedRockError(respBody);
-
-  const headers = new Headers();
-  const allowed = new Set(["content-type", "date", "cache-control", "retry-after", "x-request-id"]);
-  for (const [key, val] of upstream.headers) {
-    if (allowed.has(key.toLowerCase())) headers.set(key, val);
-  }
-  Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
-
-  return new Response(outBody, { status: upstream.status, headers });
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: {
+      "Content-Type": upstream.headers.get("Content-Type") || "application/json",
+      "Cache-Control": "no-cache",
+      ...corsHeaders,
+    },
+  });
 }
 
 // ===========================================================================
@@ -295,7 +139,7 @@ async function handleAdmin(request, env, adminSecret) {
       apiKey,
       expiresAt: record.expiresAt,
       name,
-      usage: `curl -X POST https://${request.headers.get("host")}/v1/messages -H "x-api-key: ${apiKey}" -H "Content-Type: application/json" -d '{...}'`
+      usage: `curl -X POST https://${request.headers.get("host")}/v1/chat/completions -H "x-api-key: ${apiKey}" -H "Content-Type: application/json" -d '{...}'`
     }, 201);
   }
 
@@ -322,14 +166,14 @@ export async function onRequest(context) {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  if (path === "/v1/messages" && request.method === "POST") {
+  if (path === "/v1/chat/completions" && request.method === "POST") {
     return proxyRelay(request, env);
   }
 
   if (path === "/v1/models" && request.method === "GET") {
     return json({
       object: "list",
-      data: [{ id: "claude-sonnet-4-6-20250514", object: "model", created: 1700000000, owned_by: "anthropic" }],
+      data: [{ id: "us.anthropic.claude-sonnet-4-6-v1:0", object: "model", created: 1700000000, owned_by: "anthropic" }],
     });
   }
 
