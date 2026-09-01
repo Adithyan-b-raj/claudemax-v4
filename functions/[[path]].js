@@ -150,6 +150,14 @@ async function messagesRelay(request, env) {
     body: bedrockBody,
   });
 
+  if (isStream && !upstream.ok) {
+    const errBody = await upstream.text();
+    return new Response(normalizeBedRockError(errBody), {
+      status: upstream.status,
+      headers: { "Content-Type": "application/json", ...corsHeaders },
+    });
+  }
+
   if (isStream && upstream.body) {
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
@@ -184,11 +192,9 @@ async function messagesRelay(request, env) {
             }
 
             if (eventType === "chunk") {
-              try {
-                const wrapper = JSON.parse(frame.payload);
-                const anthropicJson = atob(wrapper.bytes);
-                await writer.write(encoder.encode(`data: ${anthropicJson}\n\n`));
-              } catch {}
+              const wrapper = JSON.parse(frame.payload);
+              const anthropicJson = atob(wrapper.bytes);
+              await writer.write(encoder.encode(`data: ${anthropicJson}\n\n`));
             }
           }
         }
