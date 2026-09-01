@@ -130,9 +130,10 @@ async function messagesRelay(request, env) {
 
   let parsed;
   try { parsed = JSON.parse(rawBody); } catch { return json({ error: "Invalid JSON body" }, 400); }
-  delete parsed.model;
-  delete parsed.stream;
-  delete parsed.context_management;
+  // strip fields unsupported by Bedrock
+  for (const f of ["model", "stream", "context_management", "thinking", "betas", "raw_prompting"]) {
+    delete parsed[f];
+  }
   parsed.anthropic_version = "bedrock-2023-05-31";
   const bedrockBody = JSON.stringify(parsed);
 
