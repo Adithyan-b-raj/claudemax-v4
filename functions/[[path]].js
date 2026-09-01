@@ -130,10 +130,8 @@ async function messagesRelay(request, env) {
 
   let parsed;
   try { parsed = JSON.parse(rawBody); } catch { return json({ error: "Invalid JSON body" }, 400); }
-  // strip fields unsupported by Bedrock
-  for (const f of ["model", "stream", "context_management", "thinking", "betas", "raw_prompting"]) {
-    delete parsed[f];
-  }
+  parsed.model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
+  delete parsed.stream;
   parsed.anthropic_version = "bedrock-2023-05-31";
   const bedrockBody = JSON.stringify(parsed);
 
@@ -205,7 +203,7 @@ async function messagesRelay(request, env) {
 
     return new Response(readable, {
       status: 200,
-      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders },
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", ...corsHeaders },
     });
   }
 
