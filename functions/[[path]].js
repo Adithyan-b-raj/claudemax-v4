@@ -132,6 +132,7 @@ async function messagesRelay(request, env) {
   try { parsed = JSON.parse(rawBody); } catch { return json({ error: "Invalid JSON body" }, 400); }
   parsed.model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
   delete parsed.stream;
+  delete parsed.context_management;
   parsed.anthropic_version = "bedrock-2023-05-31";
   const bedrockBody = JSON.stringify(parsed);
 
