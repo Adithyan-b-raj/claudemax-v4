@@ -64,118 +64,154 @@ async function validateKey(request, env) {
 }
 
 // ===========================================================================
-// Translation helpers: Anthropic Messages API ↔ OpenAI chat.completions
+// Native Bedrock binary event-stream helpers
 // ===========================================================================
 
-function anthropicToOpenAI(body, model) {
-  const { messages = [], system, max_tokens, stream, temperature, top_p } = body;
-
-  const openaiMessages = [];
-  if (system) {
-    const text = Array.isArray(system) ? system.map(b => b.text || "").join("") : system;
-    openaiMessages.push({ role: "system", content: text });
+function parseEventHeaders(buf) {
+  const headers = {};
+  const dv = new DataView(buf.buffer, buf.byteOffset);
+  let i = 0;
+  while (i < buf.length) {
+    const nameLen = buf[i++];
+    const name = new TextDecoder().decode(buf.slice(i, i + nameLen)); i += nameLen;
+    i++;
+    const valLen = dv.getUint16(i, false); i += 2;
+    const value = new TextDecoder().decode(buf.slice(i, i + valLen)); i += valLen;
+    headers[name] = value;
   }
-  for (const msg of messages) {
-    const content = Array.isArray(msg.content)
-      ? msg.content.map(b => b.text || "").join("")
-      : (msg.content || "");
-    openaiMessages.push({ role: msg.role, content });
-  }
-
-  const out = { model, messages: openaiMessages };
-  if (max_tokens) out.max_tokens = max_tokens;
-  if (temperature !== undefined) out.temperature = temperature;
-  if (top_p !== undefined) out.top_p = top_p;
-  if (stream) { out.stream = true; out.stream_options = { include_usage: true }; }
-  return out;
+  return headers;
 }
 
-function openaiToAnthropic(openaiBody, model) {
-  const choice = openaiBody.choices?.[0];
-  const usage = openaiBody.usage || {};
-  return {
-    id: openaiBody.id || ("msg_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24)),
-    type: "message",
-    role: "assistant",
-    content: [{ type: "text", text: choice?.message?.content || "" }],
-    model,
-    stop_reason: choice?.finish_reason === "length" ? "max_tokens" : "end_turn",
-    stop_sequence: null,
-    usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0 },
-  };
+function readEventFrame(accumulated) {
+  if (accumulated.length < 12) return null;
+  const dv = new DataView(accumulated.buffer, accumulated.byteOffset);
+  const totalLen = dv.getUint32(0, false);
+  if (accumulated.length < totalLen) return null;
+  const headersLen = dv.getUint32(4, false);
+  const headersEnd = 12 + headersLen;
+  const payloadEnd = totalLen - 4;
+  const headers = parseEventHeaders(accumulated.slice(12, headersEnd));
+  const payload = new TextDecoder().decode(accumulated.slice(headersEnd, payloadEnd));
+  return { headers, payload, consumed: totalLen };
 }
 
-// Reads OpenAI SSE stream, emits Anthropic SSE stream — text lines only, no binary parsing
-function openaiSSEToAnthropicSSE(upstreamBody, model) {
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const enc = new TextEncoder();
-  const emit = async (obj) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+function normalizeBedRockError(body) {
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed.__type) {
+      const typeMap = {
+        "ValidationException": "invalid_request_error",
+        "ThrottlingException": "rate_limit_error",
+        "ModelNotReadyException": "api_error",
+        "ModelStreamErrorException": "api_error",
+        "AccessDeniedException": "authentication_error",
+        "ResourceNotFoundException": "not_found_error",
+      };
+      return JSON.stringify({
+        type: "error",
+        error: { type: typeMap[parsed.__type] || "api_error", message: parsed.message || parsed.__type },
+      });
+    }
+  } catch {}
+  return body;
+}
 
-  (async () => {
-    let buf = "";
-    let started = false;
-    let stopped = false;
-    let outputTokens = 0;
+// ===========================================================================
+// /v1/messages — native Bedrock invoke, Anthropic SSE output
+// ===========================================================================
 
-    try {
-      const reader = upstreamBody.pipeThrough(new TextDecoderStream()).getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += value;
-        const lines = buf.split("\n");
-        buf = lines.pop();
+async function messagesRelay(request, env) {
+  const err = await validateKey(request, env);
+  if (err) return err;
 
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const raw = line.slice(6).trim();
+  const rawBody = await request.text();
+  let isStream = false;
+  try { isStream = JSON.parse(rawBody).stream === true; } catch {}
 
-          if (raw === "[DONE]") {
-            if (!stopped) {
-              stopped = true;
-              await emit({ type: "content_block_stop", index: 0 });
-              await emit({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } });
-              await emit({ type: "message_stop" });
+  let parsed;
+  try { parsed = JSON.parse(rawBody); } catch { return json({ error: "Invalid JSON body" }, 400); }
+  delete parsed.model;
+  delete parsed.stream;
+  delete parsed.context_management;
+  parsed.anthropic_version = "bedrock-2023-05-31";
+  const bedrockBody = JSON.stringify(parsed);
+
+  const region = env.AWS_REGION || "us-east-1";
+  const model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
+  const bedrockBase = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(model)}`;
+  const invokeUrl = isStream ? `${bedrockBase}/invoke-with-response-stream` : `${bedrockBase}/invoke`;
+
+  const upstream = await fetch(invokeUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`,
+    },
+    body: bedrockBody,
+  });
+
+  if (isStream && upstream.body) {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+    const reader = upstream.body.getReader();
+    let accumulated = new Uint8Array(0);
+
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const next = new Uint8Array(accumulated.length + value.length);
+          next.set(accumulated);
+          next.set(value, accumulated.length);
+          accumulated = next;
+
+          while (true) {
+            const frame = readEventFrame(accumulated);
+            if (!frame) break;
+            accumulated = accumulated.slice(frame.consumed);
+
+            const eventType = frame.headers[":event-type"];
+
+            if (eventType === "modelStreamErrorException") {
+              try {
+                const err = JSON.parse(frame.payload);
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: { type: "api_error", message: err.message || "Bedrock stream error" } })}\n\n`));
+              } catch {}
+              break;
             }
-            continue;
-          }
 
-          let chunk;
-          try { chunk = JSON.parse(raw); } catch { continue; }
-
-          // usage-only chunk (from stream_options.include_usage)
-          if (chunk.usage) {
-            outputTokens = chunk.usage.completion_tokens || 0;
-          }
-
-          const choice = chunk.choices?.[0];
-          if (!choice) continue;
-
-          if (!started) {
-            started = true;
-            await emit({ type: "message_start", message: { id: chunk.id, type: "message", role: "assistant", content: [], model, usage: { input_tokens: 0, output_tokens: 0 } } });
-            await emit({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            await emit({ type: "ping" });
-          }
-
-          const text = choice.delta?.content;
-          if (text) await emit({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
-
-          if (choice.finish_reason && !stopped) {
-            stopped = true;
-            const stopReason = choice.finish_reason === "length" ? "max_tokens" : "end_turn";
-            await emit({ type: "content_block_stop", index: 0 });
-            await emit({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } });
-            await emit({ type: "message_stop" });
+            if (eventType === "chunk") {
+              try {
+                const wrapper = JSON.parse(frame.payload);
+                const anthropicJson = atob(wrapper.bytes);
+                await writer.write(encoder.encode(`data: ${anthropicJson}\n\n`));
+              } catch {}
+            }
           }
         }
-      }
-    } catch {}
-    finally { await writer.close(); }
-  })();
+      } catch {}
+      finally { await writer.close(); }
+    })();
 
-  return readable;
+    return new Response(readable, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders },
+    });
+  }
+
+  const respBody = await upstream.text();
+  const outBody = upstream.ok ? respBody : normalizeBedRockError(respBody);
+
+  const headers = new Headers();
+  const allowed = new Set(["content-type", "date", "cache-control", "retry-after", "x-request-id"]);
+  for (const [key, val] of upstream.headers) {
+    if (allowed.has(key.toLowerCase())) headers.set(key, val);
+  }
+  Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
+  return new Response(outBody, { status: upstream.status, headers });
 }
 
 // ===========================================================================
@@ -192,7 +228,6 @@ async function proxyRelay(request, env) {
   let body;
   try {
     const parsed = await request.json();
-    // use client-supplied model for testing, fall back to env
     parsed.model = parsed.model || model;
     body = JSON.stringify(parsed);
   } catch {
@@ -212,50 +247,6 @@ async function proxyRelay(request, env) {
     status: upstream.status,
     headers: { "Content-Type": upstream.headers.get("Content-Type") || "application/json", "Cache-Control": "no-cache", ...corsHeaders },
   });
-}
-
-// ===========================================================================
-// /v1/messages — Anthropic SDK clients, translates to/from OpenAI on the wire
-// ===========================================================================
-
-async function messagesRelay(request, env) {
-  const err = await validateKey(request, env);
-  if (err) return err;
-
-  const region = env.AWS_REGION || "us-east-1";
-  const model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
-
-  let anthropicBody;
-  try { anthropicBody = await request.json(); }
-  catch { return json({ error: "Invalid JSON body" }, 400); }
-
-  const isStream = anthropicBody.stream === true;
-  const openaiBody = anthropicToOpenAI(anthropicBody, model);
-
-  const upstream = await fetch(
-    `https://bedrock-runtime.${region}.amazonaws.com/openai/v1/chat/completions`,
-    {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`, "Content-Type": "application/json" },
-      body: JSON.stringify(openaiBody),
-    }
-  );
-
-  if (!upstream.ok) {
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
-    });
-  }
-
-  if (isStream) {
-    return new Response(openaiSSEToAnthropicSSE(upstream.body, model), {
-      status: 200,
-      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders },
-    });
-  }
-
-  return json(openaiToAnthropic(await upstream.json(), model));
 }
 
 // ===========================================================================
