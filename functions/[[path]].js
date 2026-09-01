@@ -194,7 +194,12 @@ async function messagesRelay(request, env) {
             if (eventType === "chunk") {
               const wrapper = JSON.parse(frame.payload);
               const anthropicJson = atob(wrapper.bytes);
-              await writer.write(encoder.encode(`data: ${anthropicJson}\n\n`));
+              let eventName = "";
+              try { eventName = JSON.parse(anthropicJson).type || ""; } catch {}
+              const sseData = eventName
+                ? `event: ${eventName}\ndata: ${anthropicJson}\n\n`
+                : `data: ${anthropicJson}\n\n`;
+              await writer.write(encoder.encode(sseData));
             }
           }
         }
