@@ -193,7 +193,7 @@ async function messagesRelay(request, env) {
 
             if (eventType === "chunk") {
               const wrapper = JSON.parse(frame.payload);
-              const anthropicJson = atob(wrapper.bytes);
+              const anthropicJson = new TextDecoder().decode(Uint8Array.from(atob(wrapper.bytes), c => c.charCodeAt(0)));
               let eventName = "";
               try { eventName = JSON.parse(anthropicJson).type || ""; } catch {}
               const sseData = eventName
