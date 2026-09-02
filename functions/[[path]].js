@@ -168,6 +168,9 @@ async function messagesRelay(request, env) {
 
   let parsed;
   try { parsed = JSON.parse(rawBody); } catch { return json({ error: "Invalid JSON body" }, 400); }
+  if (parsed.model && /opus/i.test(parsed.model)) {
+    return json({ type: "error", error: { type: "invalid_request_error", message: "Model not allowed. Only claude-sonnet-4-6 is available through this API." } }, 400);
+  }
   delete parsed.model;
   delete parsed.stream;
   delete parsed.context_management;
@@ -304,7 +307,10 @@ async function proxyRelay(request, env) {
   let parsedBody, isStream = false;
   try {
     parsedBody = await request.json();
-    parsedBody.model = parsedBody.model || model;
+    if (parsedBody.model && /opus/i.test(parsedBody.model)) {
+      return json({ error: { type: "invalid_request_error", message: "Model not allowed. Only claude-sonnet-4-6 is available through this API." } }, 400);
+    }
+    parsedBody.model = model;
     isStream = parsedBody.stream === true;
   } catch {
     return json({ error: "Invalid JSON body" }, 400);
