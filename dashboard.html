@@ -32,6 +32,8 @@
     .token-bar { height: 6px; border-radius: 4px; background: #4a9eff; transition: width 0.3s; }
     .token-bar.warn { background: #ffaa4a; }
     .token-bar.full { background: #ff4a4a; }
+    .edit-limit-row { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+    .edit-limit-row input { width: 120px; padding: 0.35rem 0.6rem; font-size: 0.85rem; }
     .token-breakdown { margin-top: 0.3rem; font-size: 0.78rem; color: #555; display: flex; gap: 0.8rem; flex-wrap: wrap; }
     .token-breakdown span { white-space: nowrap; }
     .token-in { color: #4a9eff; }
@@ -170,8 +172,14 @@
           </div>
           <div class="actions">
             <button class="btn-secondary" onclick="copyKey('${k.apiKey}')">Copy</button>
+            <button class="btn-secondary" onclick="toggleEditLimit('${k.apiKey}')">Edit Limit</button>
             <button class="btn-secondary" onclick="resetTokens('${k.apiKey}')">Reset</button>
             <button class="btn-danger" onclick="revokeKey('${k.apiKey}')">Revoke</button>
+          </div>
+          <div id="edit-limit-${k.apiKey}" class="edit-limit-row hidden">
+            <input type="number" id="limit-input-${k.apiKey}" value="${limit}" min="0" placeholder="0 = unlimited">
+            <button class="btn-primary" onclick="saveLimit('${k.apiKey}')">Save</button>
+            <button class="btn-secondary" onclick="toggleEditLimit('${k.apiKey}')">Cancel</button>
           </div>
         </div>`;
       }).join('');
@@ -199,6 +207,19 @@
     async function resetTokens(apiKey) {
       if (!confirm('Reset token count to 0?')) return;
       await api('POST', '/admin/reset-tokens', { apiKey });
+      loadKeys();
+    }
+
+    function toggleEditLimit(apiKey) {
+      const row = document.getElementById(`edit-limit-${apiKey}`);
+      row.classList.toggle('hidden');
+    }
+
+    async function saveLimit(apiKey) {
+      const val = parseInt(document.getElementById(`limit-input-${apiKey}`).value) || 0;
+      const data = await api('POST', '/admin/update-token-limit', { apiKey, tokenLimit: val });
+      if (data.error) { showAlert(data.error, 'error'); return; }
+      showAlert('Token limit updated', 'success');
       loadKeys();
     }
 

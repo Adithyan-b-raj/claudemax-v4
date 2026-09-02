@@ -387,6 +387,14 @@ async function handleAdmin(request, env, adminSecret) {
     return json({ ok: true });
   }
 
+  if (request.method === "POST" && path === "/admin/update-token-limit") {
+    const body = await request.json().catch(() => ({}));
+    if (!body.apiKey) return json({ error: "apiKey required" }, 400);
+    const tokenLimit = Math.max(0, parseInt(body.tokenLimit) || 0);
+    await env.claudemax_v4db.prepare("UPDATE api_keys SET token_limit = ? WHERE api_key = ?").bind(tokenLimit, body.apiKey).run();
+    return json({ ok: true });
+  }
+
   if (request.method === "POST" && path === "/admin/migrate") {
     const alters = [
       "ALTER TABLE api_keys ADD COLUMN input_tokens INTEGER DEFAULT 0",
