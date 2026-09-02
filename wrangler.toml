@@ -2,10 +2,10 @@ name = "bedrock-simple"
 compatibility_date = "2025-01-01"
 pages_build_output_dir = "./"
 
-# KV namespace for API keys (create one in Cloudflare dashboard)
-[[kv_namespaces]]
-binding = "API_KEYS"
-id = "bb311e32cefa4a40ab5899f77ce580cc"
+[[d1_databases]]
+binding = "claudemax_v4db"
+database_name = "claudemax-v4db"
+database_id = "eedcc213-cd01-48ba-aba0-1b9af675c485"
 
 [vars]
 AWS_REGION = "us-east-1"

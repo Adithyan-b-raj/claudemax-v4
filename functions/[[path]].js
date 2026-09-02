@@ -12,55 +12,60 @@ function json(body, status = 200) {
 }
 
 // ===========================================================================
-// KV Data Layer
+// D1 Data Layer
 // ===========================================================================
 
 async function getKey(env, apiKey) {
-  return await env.API_KEYS.get(apiKey, "json");
+  return await env.claudemax_v4db.prepare("SELECT * FROM api_keys WHERE api_key = ?").bind(apiKey).first();
 }
 
-async function putKey(env, apiKey, record, ttlSec) {
-  await env.API_KEYS.put(apiKey, JSON.stringify(record), { expirationTtl: ttlSec });
+async function putKey(env, apiKey, record) {
+  await env.claudemax_v4db.prepare(
+    `INSERT OR REPLACE INTO api_keys (api_key, name, created_at, expires_at, token_limit, tokens_used)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(apiKey, record.name, record.createdAt, record.expiresAt, record.tokenLimit ?? 0, 0).run();
 }
 
 async function deleteKey(env, apiKey) {
-  await env.API_KEYS.delete(apiKey);
-  await removeFromIndex(env, apiKey);
+  await env.claudemax_v4db.prepare("DELETE FROM api_keys WHERE api_key = ?").bind(apiKey).run();
 }
 
-async function getIndex(env) {
-  return (await env.API_KEYS.get("__index__", "json")) || [];
+async function getAllKeys(env) {
+  const result = await env.claudemax_v4db.prepare("SELECT * FROM api_keys ORDER BY created_at DESC").all();
+  return result.results ?? [];
 }
 
-async function addToIndex(env, apiKey) {
-  const index = await getIndex(env);
-  if (!index.includes(apiKey)) {
-    index.push(apiKey);
-    await env.API_KEYS.put("__index__", JSON.stringify(index));
-  }
-}
-
-async function removeFromIndex(env, apiKey) {
-  const index = await getIndex(env);
-  await env.API_KEYS.put("__index__", JSON.stringify(index.filter(k => k !== apiKey)));
+async function incrementTokens(env, apiKey, tokens) {
+  if (tokens <= 0) return;
+  await env.claudemax_v4db.prepare("UPDATE api_keys SET tokens_used = tokens_used + ? WHERE api_key = ?")
+    .bind(tokens, apiKey).run();
 }
 
 // ===========================================================================
-// Auth helper
+// Auth helper — returns { apiKey, record } or { error: Response }
 // ===========================================================================
 
 async function validateKey(request, env) {
-  const apiKey = request.headers.get("x-api-key")
-    || request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim()
-    || new URL(request.url).searchParams.get("apiKey");
-  if (!apiKey) return json({ error: "Missing X-Api-Key header or apiKey param" }, 401);
+  const apiKey =
+    request.headers.get("x-api-key") ||
+    request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim() ||
+    new URL(request.url).searchParams.get("apiKey");
+
+  if (!apiKey) return { error: json({ error: "Missing X-Api-Key header or apiKey param" }, 401) };
+
   const record = await getKey(env, apiKey);
-  if (!record) return json({ error: "Invalid API key" }, 403);
-  if (new Date(record.expiresAt) < new Date()) {
+  if (!record) return { error: json({ error: "Invalid API key" }, 403) };
+
+  if (new Date(record.expires_at) < new Date()) {
     await deleteKey(env, apiKey);
-    return json({ error: "API key expired" }, 403);
+    return { error: json({ error: "API key expired" }, 403) };
   }
-  return null;
+
+  if (record.token_limit > 0 && record.tokens_used >= record.token_limit) {
+    return { error: json({ error: "Token limit exceeded" }, 429) };
+  }
+
+  return { apiKey, record };
 }
 
 // ===========================================================================
@@ -121,8 +126,9 @@ function normalizeBedRockError(body) {
 // ===========================================================================
 
 async function messagesRelay(request, env) {
-  const err = await validateKey(request, env);
-  if (err) return err;
+  const auth = await validateKey(request, env);
+  if (auth.error) return auth.error;
+  const { apiKey } = auth;
 
   const rawBody = await request.text();
   let isStream = false;
@@ -164,6 +170,8 @@ async function messagesRelay(request, env) {
     const encoder = new TextEncoder();
     const reader = upstream.body.getReader();
     let accumulated = new Uint8Array(0);
+    let inputTokens = 0;
+    let outputTokens = 0;
 
     (async () => {
       try {
@@ -194,6 +202,13 @@ async function messagesRelay(request, env) {
             if (eventType === "chunk") {
               const wrapper = JSON.parse(frame.payload);
               const anthropicJson = new TextDecoder().decode(Uint8Array.from(atob(wrapper.bytes), c => c.charCodeAt(0)));
+
+              try {
+                const evt = JSON.parse(anthropicJson);
+                if (evt.type === "message_start") inputTokens = evt.message?.usage?.input_tokens ?? 0;
+                if (evt.type === "message_delta" && evt.usage) outputTokens = evt.usage.output_tokens ?? 0;
+              } catch {}
+
               let eventName = "";
               try { eventName = JSON.parse(anthropicJson).type || ""; } catch {}
               const sseData = eventName
@@ -204,7 +219,10 @@ async function messagesRelay(request, env) {
           }
         }
       } catch {}
-      finally { await writer.close(); }
+      finally {
+        await writer.close();
+        await incrementTokens(env, apiKey, inputTokens + outputTokens);
+      }
     })();
 
     return new Response(readable, {
@@ -214,8 +232,16 @@ async function messagesRelay(request, env) {
   }
 
   const respBody = await upstream.text();
-  const outBody = upstream.ok ? respBody : normalizeBedRockError(respBody);
 
+  if (upstream.ok) {
+    try {
+      const respParsed = JSON.parse(respBody);
+      const tokens = (respParsed.usage?.input_tokens ?? 0) + (respParsed.usage?.output_tokens ?? 0);
+      await incrementTokens(env, apiKey, tokens);
+    } catch {}
+  }
+
+  const outBody = upstream.ok ? respBody : normalizeBedRockError(respBody);
   const headers = new Headers();
   const allowed = new Set(["content-type", "date", "cache-control", "retry-after", "x-request-id"]);
   for (const [key, val] of upstream.headers) {
@@ -226,21 +252,22 @@ async function messagesRelay(request, env) {
 }
 
 // ===========================================================================
-// /v1/chat/completions — pure OpenAI passthrough
+// /v1/chat/completions — OpenAI-compatible passthrough
 // ===========================================================================
 
 async function proxyRelay(request, env) {
-  const err = await validateKey(request, env);
-  if (err) return err;
+  const auth = await validateKey(request, env);
+  if (auth.error) return auth.error;
+  const { apiKey } = auth;
 
   const region = env.AWS_REGION || "us-east-1";
   const model = env.ANTHROPIC_MODEL || "us.anthropic.claude-sonnet-4-6";
 
-  let body;
+  let parsedBody, isStream = false;
   try {
-    const parsed = await request.json();
-    parsed.model = parsed.model || model;
-    body = JSON.stringify(parsed);
+    parsedBody = await request.json();
+    parsedBody.model = parsedBody.model || model;
+    isStream = parsedBody.stream === true;
   } catch {
     return json({ error: "Invalid JSON body" }, 400);
   }
@@ -250,11 +277,27 @@ async function proxyRelay(request, env) {
     {
       method: "POST",
       headers: { "Authorization": `Bearer ${env.AWS_BEARER_TOKEN_BEDROCK}`, "Content-Type": "application/json" },
-      body,
+      body: JSON.stringify(parsedBody),
     }
   );
 
-  return new Response(upstream.body, {
+  if (isStream) {
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: { "Content-Type": upstream.headers.get("Content-Type") || "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders },
+    });
+  }
+
+  const respBody = await upstream.text();
+  if (upstream.ok) {
+    try {
+      const respParsed = JSON.parse(respBody);
+      const tokens = (respParsed.usage?.prompt_tokens ?? 0) + (respParsed.usage?.completion_tokens ?? 0);
+      await incrementTokens(env, apiKey, tokens);
+    } catch {}
+  }
+
+  return new Response(respBody, {
     status: upstream.status,
     headers: { "Content-Type": upstream.headers.get("Content-Type") || "application/json", "Cache-Control": "no-cache", ...corsHeaders },
   });
@@ -278,12 +321,16 @@ async function handleAdmin(request, env, adminSecret) {
   }
 
   if (request.method === "GET" && path === "/admin/keys") {
-    const index = await getIndex(env);
-    const keys = [];
-    for (const k of index) {
-      const data = await getKey(env, k);
-      if (data) keys.push({ ...data, apiKey: k, id: k });
-    }
+    const rows = await getAllKeys(env);
+    const keys = rows.map(r => ({
+      id: r.api_key,
+      apiKey: r.api_key,
+      name: r.name,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at,
+      tokenLimit: r.token_limit,
+      tokensUsed: r.tokens_used,
+    }));
     return json({ keys });
   }
 
@@ -291,17 +338,24 @@ async function handleAdmin(request, env, adminSecret) {
     const body = await request.json().catch(() => ({}));
     const days = Math.min(365, Math.max(1, parseInt(body.days) || 7));
     const name = (body.name || "api-key").slice(0, 50);
+    const tokenLimit = Math.max(0, parseInt(body.tokenLimit) || 0);
     const apiKey = generateKey(32);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + days * 86400000);
-    const record = { expiresAt: expiresAt.toISOString(), createdAt: now.toISOString(), name };
-    await putKey(env, apiKey, record, Math.ceil((days + 1) * 86400));
-    await addToIndex(env, apiKey);
+    const record = {
+      name,
+      createdAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      tokenLimit,
+    };
+    await putKey(env, apiKey, record);
     return json({
       apiKey,
-      expiresAt: record.expiresAt,
       name,
-      usage: `curl -X POST https://${request.headers.get("host")}/v1/messages -H "x-api-key: ${apiKey}" -H "Content-Type: application/json" -d '{...}'`
+      expiresAt: record.expiresAt,
+      tokenLimit,
+      tokensUsed: 0,
+      usage: `curl -X POST https://${request.headers.get("host")}/v1/messages -H "x-api-key: ${apiKey}" -H "Content-Type: application/json" -d '{...}'`,
     }, 201);
   }
 
@@ -309,6 +363,13 @@ async function handleAdmin(request, env, adminSecret) {
     const body = await request.json().catch(() => ({}));
     if (!body.apiKey) return json({ error: "apiKey required" }, 400);
     await deleteKey(env, body.apiKey);
+    return json({ ok: true });
+  }
+
+  if (request.method === "POST" && path === "/admin/reset-tokens") {
+    const body = await request.json().catch(() => ({}));
+    if (!body.apiKey) return json({ error: "apiKey required" }, 400);
+    await env.claudemax_v4db.prepare("UPDATE api_keys SET tokens_used = 0 WHERE api_key = ?").bind(body.apiKey).run();
     return json({ ok: true });
   }
 
