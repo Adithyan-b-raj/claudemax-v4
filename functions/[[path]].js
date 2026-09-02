@@ -220,8 +220,8 @@ async function messagesRelay(request, env) {
         }
       } catch {}
       finally {
-        await writer.close();
         await incrementTokens(env, apiKey, inputTokens + outputTokens);
+        await writer.close();
       }
     })();
 
