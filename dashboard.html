@@ -28,6 +28,10 @@
     .key-info { flex: 1; min-width: 200px; }
     .key-name { font-weight: 600; color: #fff; margin-bottom: 0.3rem; }
     .key-meta { font-size: 0.85rem; color: #666; }
+    .token-bar-wrap { margin-top: 0.4rem; background: #222; border-radius: 4px; height: 6px; width: 200px; max-width: 100%; }
+    .token-bar { height: 6px; border-radius: 4px; background: #4a9eff; transition: width 0.3s; }
+    .token-bar.warn { background: #ffaa4a; }
+    .token-bar.full { background: #ff4a4a; }
     .key-value { font-family: monospace; font-size: 0.85rem; background: #1a1a1a; padding: 0.4rem 0.6rem; border-radius: 4px; color: #4a9eff; word-break: break-all; }
     .actions { display: flex; gap: 0.5rem; }
     .login-form { max-width: 400px; margin: 4rem auto; }
@@ -66,6 +70,10 @@
           <div class="form-group">
             <label>Expires In (days)</label>
             <input type="number" id="key-days" value="7" min="1" max="365">
+          </div>
+          <div class="form-group">
+            <label>Token Limit (0 = unlimited)</label>
+            <input type="number" id="key-token-limit" value="0" min="0">
           </div>
           <div class="form-group" style="display: flex; align-items: flex-end;">
             <button class="btn-primary" onclick="createKey()">Create Key</button>
@@ -128,25 +136,36 @@
         document.getElementById('key-list').innerHTML = '<div class="empty">No keys yet</div>';
         return;
       }
-      document.getElementById('key-list').innerHTML = data.keys.map(k => `
+      document.getElementById('key-list').innerHTML = data.keys.map(k => {
+        const used = k.tokensUsed ?? 0;
+        const limit = k.tokenLimit ?? 0;
+        const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+        const barClass = pct >= 100 ? 'full' : pct >= 80 ? 'warn' : '';
+        const tokenText = limit > 0
+          ? `${used.toLocaleString()} / ${limit.toLocaleString()} tokens`
+          : `${used.toLocaleString()} tokens used (unlimited)`;
+        return `
         <div class="key-item">
           <div class="key-info">
             <div class="key-name">${escapeHtml(k.name)}</div>
-            <div class="key-meta">Expires: ${new Date(k.expiresAt).toLocaleDateString()}</div>
+            <div class="key-meta">Expires: ${new Date(k.expiresAt).toLocaleDateString()} &nbsp;·&nbsp; ${tokenText}</div>
+            ${limit > 0 ? `<div class="token-bar-wrap"><div class="token-bar ${barClass}" style="width:${pct}%"></div></div>` : ''}
             <div class="key-value">${k.apiKey}</div>
           </div>
           <div class="actions">
             <button class="btn-secondary" onclick="copyKey('${k.apiKey}')">Copy</button>
+            <button class="btn-secondary" onclick="resetTokens('${k.apiKey}')">Reset</button>
             <button class="btn-danger" onclick="revokeKey('${k.apiKey}')">Revoke</button>
           </div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
     }
 
     async function createKey() {
       const name = document.getElementById('key-name').value || 'api-key';
       const days = parseInt(document.getElementById('key-days').value) || 7;
-      const data = await api('POST', '/admin/create', { name, days });
+      const tokenLimit = parseInt(document.getElementById('key-token-limit').value) || 0;
+      const data = await api('POST', '/admin/create', { name, days, tokenLimit });
       if (data.error) {
         showAlert(data.error, 'error');
         return;
@@ -158,6 +177,12 @@
     async function revokeKey(apiKey) {
       if (!confirm('Revoke this key?')) return;
       await api('POST', '/admin/revoke', { apiKey });
+      loadKeys();
+    }
+
+    async function resetTokens(apiKey) {
+      if (!confirm('Reset token count to 0?')) return;
+      await api('POST', '/admin/reset-tokens', { apiKey });
       loadKeys();
     }
 
