@@ -82,7 +82,11 @@
             <label>Token Limit (0 = unlimited)</label>
             <input type="number" id="key-token-limit" value="0" min="0">
           </div>
-          <div class="form-group" style="display: flex; align-items: flex-end;">
+          <div class="form-group" style="display: flex; align-items: flex-end; gap: 0.8rem;">
+            <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; margin-bottom:0;">
+              <input type="checkbox" id="key-refill" style="width:auto;">
+              <span style="font-size:0.85rem; color:#aaa;">5h IST refill</span>
+            </label>
             <button class="btn-primary" onclick="createKey()">Create Key</button>
           </div>
         </div>
@@ -154,6 +158,9 @@
         const tokenText = limit > 0
           ? `${used.toLocaleString()} / ${limit.toLocaleString()} tokens`
           : `${used.toLocaleString()} tokens used (unlimited)`;
+        const refillLabel = k.hasRefill && k.tokensRefillAt
+          ? `<span style="font-size:0.78rem; color:#888;">Refills at: ${new Date(k.tokensRefillAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })} IST</span>`
+          : '';
         const breakdown = (input > 0 || output > 0 || cache > 0)
           ? `<div class="token-breakdown">
                <span class="token-in">In: ${input.toLocaleString()}</span>
@@ -168,11 +175,13 @@
             <div class="key-meta">Expires: ${new Date(k.expiresAt).toLocaleDateString()} &nbsp;·&nbsp; ${tokenText}</div>
             ${limit > 0 ? `<div class="token-bar-wrap"><div class="token-bar ${barClass}" style="width:${pct}%"></div></div>` : ''}
             ${breakdown}
+            ${refillLabel}
             <div class="key-value">${k.apiKey}</div>
           </div>
           <div class="actions">
             <button class="btn-secondary" onclick="copyKey('${k.apiKey}')">Copy</button>
             <button class="btn-secondary" onclick="toggleEditLimit('${k.apiKey}')">Edit Limit</button>
+            <button class="btn-secondary" onclick="toggleRefill('${k.apiKey}', ${k.hasRefill})" style="${k.hasRefill ? 'color:#4aff9e' : ''}">${k.hasRefill ? 'Refill ON' : 'Refill OFF'}</button>
             <button class="btn-secondary" onclick="resetTokens('${k.apiKey}')">Reset</button>
             <button class="btn-danger" onclick="revokeKey('${k.apiKey}')">Revoke</button>
           </div>
@@ -189,7 +198,8 @@
       const name = document.getElementById('key-name').value || 'api-key';
       const days = parseInt(document.getElementById('key-days').value) || 7;
       const tokenLimit = parseInt(document.getElementById('key-token-limit').value) || 0;
-      const data = await api('POST', '/admin/create', { name, days, tokenLimit });
+      const enableRefill = document.getElementById('key-refill').checked;
+      const data = await api('POST', '/admin/create', { name, days, tokenLimit, enableRefill });
       if (data.error) {
         showAlert(data.error, 'error');
         return;
@@ -207,6 +217,14 @@
     async function resetTokens(apiKey) {
       if (!confirm('Reset token count to 0?')) return;
       await api('POST', '/admin/reset-tokens', { apiKey });
+      loadKeys();
+    }
+
+    async function toggleRefill(apiKey, currentlyEnabled) {
+      const enable = !currentlyEnabled;
+      const data = await api('POST', '/admin/update-refill', { apiKey, enable });
+      if (data.error) { showAlert(data.error, 'error'); return; }
+      showAlert(enable ? 'Refill enabled' : 'Refill disabled', 'success');
       loadKeys();
     }
 
