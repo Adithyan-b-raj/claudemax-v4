@@ -209,7 +209,7 @@ async function messagesRelay(request, env) {
 
     return new Response(readable, {
       status: 200,
-      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", ...corsHeaders },
+      headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", ...corsHeaders },
     });
   }
 
