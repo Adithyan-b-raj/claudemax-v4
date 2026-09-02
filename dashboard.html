@@ -24,8 +24,8 @@
     .btn-secondary { background: #333; color: #fff; }
     .btn-secondary:hover { background: #444; }
     .key-list { margin-top: 1rem; }
-    .key-item { background: #0f0f0f; padding: 1rem; border-radius: 8px; margin-bottom: 0.8rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
-    .key-info { flex: 1; min-width: 200px; }
+    .key-item { background: #0f0f0f; padding: 1rem; border-radius: 8px; margin-bottom: 0.8rem; display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem; }
+    .key-info { flex: 1; min-width: 0; }
     .key-name { font-weight: 600; color: #fff; margin-bottom: 0.3rem; }
     .key-meta { font-size: 0.85rem; color: #666; }
     .token-bar-wrap { margin-top: 0.4rem; background: #222; border-radius: 4px; height: 6px; width: 200px; max-width: 100%; }
@@ -40,7 +40,13 @@
     .token-out { color: #4aff9e; }
     .token-cache { color: #ffaa4a; }
     .key-value { font-family: monospace; font-size: 0.85rem; background: #1a1a1a; padding: 0.4rem 0.6rem; border-radius: 4px; color: #4a9eff; word-break: break-all; }
-    .actions { display: flex; gap: 0.5rem; }
+    .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; flex-shrink: 0; }
+    .actions button { flex: 1 1 auto; min-width: 70px; font-size: 0.82rem; padding: 0.5rem 0.7rem; }
+    @media (max-width: 500px) {
+      body { padding: 1rem; }
+      .key-item { flex-direction: column; }
+      .actions { width: 100%; }
+    }
     .login-form { max-width: 400px; margin: 4rem auto; }
     .hidden { display: none; }
     .alert { padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
