@@ -21,9 +21,9 @@ async function getKey(env, apiKey) {
 
 async function putKey(env, apiKey, record) {
   await env.claudemax_v4db.prepare(
-    `INSERT OR REPLACE INTO api_keys (api_key, name, created_at, expires_at, token_limit, tokens_used)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(apiKey, record.name, record.createdAt, record.expiresAt, record.tokenLimit ?? 0, 0).run();
+    `INSERT OR REPLACE INTO api_keys (api_key, name, created_at, expires_at, token_limit, tokens_used, input_tokens, output_tokens, cache_tokens)
+     VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)`
+  ).bind(apiKey, record.name, record.createdAt, record.expiresAt, record.tokenLimit ?? 0).run();
 }
 
 async function deleteKey(env, apiKey) {
@@ -35,10 +35,12 @@ async function getAllKeys(env) {
   return result.results ?? [];
 }
 
-async function incrementTokens(env, apiKey, tokens) {
-  if (tokens <= 0) return;
-  await env.claudemax_v4db.prepare("UPDATE api_keys SET tokens_used = tokens_used + ? WHERE api_key = ?")
-    .bind(tokens, apiKey).run();
+async function incrementTokens(env, apiKey, { input = 0, output = 0, cache = 0 } = {}) {
+  const total = input + output + cache;
+  if (total <= 0) return;
+  await env.claudemax_v4db.prepare(
+    "UPDATE api_keys SET tokens_used = tokens_used + ?, input_tokens = input_tokens + ?, output_tokens = output_tokens + ?, cache_tokens = cache_tokens + ? WHERE api_key = ?"
+  ).bind(total, input, output, cache, apiKey).run();
 }
 
 // ===========================================================================
@@ -172,6 +174,7 @@ async function messagesRelay(request, env) {
     let accumulated = new Uint8Array(0);
     let inputTokens = 0;
     let outputTokens = 0;
+    let cacheTokens = 0;
 
     (async () => {
       try {
@@ -205,7 +208,10 @@ async function messagesRelay(request, env) {
 
               try {
                 const evt = JSON.parse(anthropicJson);
-                if (evt.type === "message_start") inputTokens = evt.message?.usage?.input_tokens ?? 0;
+                if (evt.type === "message_start") {
+                  inputTokens = evt.message?.usage?.input_tokens ?? 0;
+                  cacheTokens = (evt.message?.usage?.cache_creation_input_tokens ?? 0) + (evt.message?.usage?.cache_read_input_tokens ?? 0);
+                }
                 if (evt.type === "message_delta" && evt.usage) outputTokens = evt.usage.output_tokens ?? 0;
               } catch {}
 
@@ -220,7 +226,7 @@ async function messagesRelay(request, env) {
         }
       } catch {}
       finally {
-        await incrementTokens(env, apiKey, inputTokens + outputTokens);
+        await incrementTokens(env, apiKey, { input: inputTokens, output: outputTokens, cache: cacheTokens });
         await writer.close();
       }
     })();
@@ -236,8 +242,10 @@ async function messagesRelay(request, env) {
   if (upstream.ok) {
     try {
       const respParsed = JSON.parse(respBody);
-      const tokens = (respParsed.usage?.input_tokens ?? 0) + (respParsed.usage?.output_tokens ?? 0);
-      await incrementTokens(env, apiKey, tokens);
+      const input = respParsed.usage?.input_tokens ?? 0;
+      const output = respParsed.usage?.output_tokens ?? 0;
+      const cache = (respParsed.usage?.cache_creation_input_tokens ?? 0) + (respParsed.usage?.cache_read_input_tokens ?? 0);
+      await incrementTokens(env, apiKey, { input, output, cache });
     } catch {}
   }
 
@@ -292,8 +300,9 @@ async function proxyRelay(request, env) {
   if (upstream.ok) {
     try {
       const respParsed = JSON.parse(respBody);
-      const tokens = (respParsed.usage?.prompt_tokens ?? 0) + (respParsed.usage?.completion_tokens ?? 0);
-      await incrementTokens(env, apiKey, tokens);
+      const input = respParsed.usage?.prompt_tokens ?? 0;
+      const output = respParsed.usage?.completion_tokens ?? 0;
+      await incrementTokens(env, apiKey, { input, output });
     } catch {}
   }
 
@@ -330,6 +339,9 @@ async function handleAdmin(request, env, adminSecret) {
       expiresAt: r.expires_at,
       tokenLimit: r.token_limit,
       tokensUsed: r.tokens_used,
+      inputTokens: r.input_tokens ?? 0,
+      outputTokens: r.output_tokens ?? 0,
+      cacheTokens: r.cache_tokens ?? 0,
     }));
     return json({ keys });
   }
@@ -369,8 +381,28 @@ async function handleAdmin(request, env, adminSecret) {
   if (request.method === "POST" && path === "/admin/reset-tokens") {
     const body = await request.json().catch(() => ({}));
     if (!body.apiKey) return json({ error: "apiKey required" }, 400);
-    await env.claudemax_v4db.prepare("UPDATE api_keys SET tokens_used = 0 WHERE api_key = ?").bind(body.apiKey).run();
+    await env.claudemax_v4db.prepare(
+      "UPDATE api_keys SET tokens_used = 0, input_tokens = 0, output_tokens = 0, cache_tokens = 0 WHERE api_key = ?"
+    ).bind(body.apiKey).run();
     return json({ ok: true });
+  }
+
+  if (request.method === "POST" && path === "/admin/migrate") {
+    const alters = [
+      "ALTER TABLE api_keys ADD COLUMN input_tokens INTEGER DEFAULT 0",
+      "ALTER TABLE api_keys ADD COLUMN output_tokens INTEGER DEFAULT 0",
+      "ALTER TABLE api_keys ADD COLUMN cache_tokens INTEGER DEFAULT 0",
+    ];
+    const results = [];
+    for (const sql of alters) {
+      try {
+        await env.claudemax_v4db.prepare(sql).run();
+        results.push({ sql, ok: true });
+      } catch (e) {
+        results.push({ sql, ok: false, note: e.message });
+      }
+    }
+    return json({ results });
   }
 
   return json({ error: "not found" }, 404);
