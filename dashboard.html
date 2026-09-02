@@ -191,6 +191,8 @@
           </div>
           <div class="actions">
             <button class="btn-secondary" onclick="copyKey('${k.apiKey}')">Copy</button>
+            <button class="btn-secondary" onclick="copyEnv('${k.apiKey}')">Copy Env</button>
+            <button class="btn-secondary" onclick="copyScript('${k.apiKey}')">Copy Script</button>
             <button class="btn-secondary" onclick="toggleEditLimit('${k.apiKey}')">Edit Limit</button>
             <button class="btn-secondary" onclick="toggleRefill('${k.apiKey}', ${k.hasRefill}, '${k.refillInterval}')" style="${k.hasRefill ? 'color:#4aff9e' : ''}">${k.hasRefill ? `Refill ${k.refillInterval === 'daily' ? 'Daily' : '5h'}` : 'Refill OFF'}</button>
             <button class="btn-secondary" onclick="resetTokens('${k.apiKey}')">Reset</button>
@@ -267,6 +269,25 @@
     function copyKey(key) {
       navigator.clipboard.writeText(key);
       showAlert('Copied to clipboard', 'success');
+    }
+
+    function copyEnv(key) {
+      const text = JSON.stringify({
+        env: {
+          ANTHROPIC_API_KEY: key,
+          ANTHROPIC_BASE_URL: "https://claudemax-v4.pages.dev",
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        },
+        model: "claude-sonnet-4-6"
+      }, null, 2);
+      navigator.clipboard.writeText(text);
+      showAlert('Env JSON copied', 'success');
+    }
+
+    function copyScript(key) {
+      const text = `if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"\r\n(\r\necho {\r\necho   "env": {\r\necho     "ANTHROPIC_API_KEY": "${key}",\r\necho     "ANTHROPIC_BASE_URL": "https://claudemax-v4.pages.dev",\r\necho     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"\r\necho   },\r\necho   "model": "claude-sonnet-4-6"\r\necho }\r\n) > "%USERPROFILE%\\.claude\\settings.json"`;
+      navigator.clipboard.writeText(text);
+      showAlert('Script copied', 'success');
     }
 
     function escapeHtml(str) {
