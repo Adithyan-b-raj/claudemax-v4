@@ -89,10 +89,14 @@
             <input type="number" id="key-token-limit" value="0" min="0">
           </div>
           <div class="form-group" style="display: flex; align-items: flex-end; gap: 0.8rem;">
-            <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; margin-bottom:0;">
-              <input type="checkbox" id="key-refill" style="width:auto;">
-              <span style="font-size:0.85rem; color:#aaa;">5h IST refill</span>
-            </label>
+            <div>
+              <label style="font-size:0.85rem; color:#aaa; display:block; margin-bottom:0.3rem;">Refill</label>
+              <select id="key-refill" style="background:#1a1a2e; color:#e0e0e0; border:1px solid #333; border-radius:6px; padding:0.4rem 0.6rem; font-size:0.85rem;">
+                <option value="none">None</option>
+                <option value="5h">Every 5h IST</option>
+                <option value="daily">Daily 00:00 IST</option>
+              </select>
+            </div>
             <button class="btn-primary" onclick="createKey()">Create Key</button>
           </div>
         </div>
@@ -164,8 +168,9 @@
         const tokenText = limit > 0
           ? `${used.toLocaleString()} / ${limit.toLocaleString()} tokens`
           : `${used.toLocaleString()} tokens used (unlimited)`;
+        const refillIntervalLabel = k.refillInterval === "daily" ? "daily 00:00" : "every 5h";
         const refillLabel = k.hasRefill && k.tokensRefillAt
-          ? `<span style="font-size:0.78rem; color:#888;">Refills at: ${new Date(k.tokensRefillAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })} IST</span>`
+          ? `<span style="font-size:0.78rem; color:#888;">Refills ${refillIntervalLabel} · next: ${new Date(k.tokensRefillAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })} IST</span>`
           : '';
         const breakdown = (input > 0 || output > 0 || cache > 0)
           ? `<div class="token-breakdown">
@@ -187,7 +192,7 @@
           <div class="actions">
             <button class="btn-secondary" onclick="copyKey('${k.apiKey}')">Copy</button>
             <button class="btn-secondary" onclick="toggleEditLimit('${k.apiKey}')">Edit Limit</button>
-            <button class="btn-secondary" onclick="toggleRefill('${k.apiKey}', ${k.hasRefill})" style="${k.hasRefill ? 'color:#4aff9e' : ''}">${k.hasRefill ? 'Refill ON' : 'Refill OFF'}</button>
+            <button class="btn-secondary" onclick="toggleRefill('${k.apiKey}', ${k.hasRefill}, '${k.refillInterval}')" style="${k.hasRefill ? 'color:#4aff9e' : ''}">${k.hasRefill ? `Refill ${k.refillInterval === 'daily' ? 'Daily' : '5h'}` : 'Refill OFF'}</button>
             <button class="btn-secondary" onclick="resetTokens('${k.apiKey}')">Reset</button>
             <button class="btn-danger" onclick="revokeKey('${k.apiKey}')">Revoke</button>
           </div>
@@ -204,8 +209,10 @@
       const name = document.getElementById('key-name').value || 'api-key';
       const days = parseInt(document.getElementById('key-days').value) || 7;
       const tokenLimit = parseInt(document.getElementById('key-token-limit').value) || 0;
-      const enableRefill = document.getElementById('key-refill').checked;
-      const data = await api('POST', '/admin/create', { name, days, tokenLimit, enableRefill });
+      const refillSelect = document.getElementById('key-refill').value;
+      const enableRefill = refillSelect !== 'none';
+      const refillInterval = enableRefill ? refillSelect : '5h';
+      const data = await api('POST', '/admin/create', { name, days, tokenLimit, enableRefill, refillInterval });
       if (data.error) {
         showAlert(data.error, 'error');
         return;
@@ -226,11 +233,21 @@
       loadKeys();
     }
 
-    async function toggleRefill(apiKey, currentlyEnabled) {
-      const enable = !currentlyEnabled;
-      const data = await api('POST', '/admin/update-refill', { apiKey, enable });
+    async function toggleRefill(apiKey, currentlyEnabled, currentInterval) {
+      let enable, refillInterval;
+      if (!currentlyEnabled) {
+        const choice = prompt('Refill interval:\n  5h  — every 5 hours IST\n  daily — 00:00 IST\n\nType 5h or daily:');
+        if (!choice) return;
+        if (!['5h', 'daily'].includes(choice.trim())) { showAlert('Invalid interval. Use 5h or daily.', 'error'); return; }
+        enable = true;
+        refillInterval = choice.trim();
+      } else {
+        enable = false;
+        refillInterval = currentInterval || '5h';
+      }
+      const data = await api('POST', '/admin/update-refill', { apiKey, enable, refillInterval });
       if (data.error) { showAlert(data.error, 'error'); return; }
-      showAlert(enable ? 'Refill enabled' : 'Refill disabled', 'success');
+      showAlert(enable ? `Refill enabled (${refillInterval})` : 'Refill disabled', 'success');
       loadKeys();
     }
 

@@ -35,13 +35,27 @@ function nextISTResetTime(now) {
   return new Date(next.getTime() - IST_OFFSET_MS);
 }
 
+function nextISTMidnight(now) {
+  const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+  const istAsUtc = new Date(now.getTime() + IST_OFFSET_MS);
+  istAsUtc.setUTCDate(istAsUtc.getUTCDate() + 1);
+  istAsUtc.setUTCHours(0, 0, 0, 0);
+  return new Date(istAsUtc.getTime() - IST_OFFSET_MS);
+}
+
+function nextRefillTime(interval) {
+  const now = new Date();
+  return interval === "daily" ? nextISTMidnight(now).toISOString() : nextISTResetTime(now).toISOString();
+}
+
 async function putKey(env, apiKey, record) {
   const hasRefill = record.hasRefill ? 1 : 0;
-  const refillAt = record.hasRefill ? nextISTResetTime(new Date()).toISOString() : null;
+  const interval = record.refillInterval || "5h";
+  const refillAt = record.hasRefill ? nextRefillTime(interval) : null;
   await env.claudemax_v4db.prepare(
-    `INSERT OR REPLACE INTO api_keys (api_key, name, created_at, expires_at, token_limit, tokens_used, input_tokens, output_tokens, cache_tokens, has_refill, tokens_refill_at)
-     VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)`
-  ).bind(apiKey, record.name, record.createdAt, record.expiresAt, record.tokenLimit ?? 0, hasRefill, refillAt).run();
+    `INSERT OR REPLACE INTO api_keys (api_key, name, created_at, expires_at, token_limit, tokens_used, input_tokens, output_tokens, cache_tokens, has_refill, tokens_refill_at, refill_interval)
+     VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)`
+  ).bind(apiKey, record.name, record.createdAt, record.expiresAt, record.tokenLimit ?? 0, hasRefill, refillAt, interval).run();
 }
 
 async function deleteKey(env, apiKey) {
@@ -82,7 +96,7 @@ async function validateKey(request, env) {
   }
 
   if (record.has_refill && record.tokens_refill_at && new Date(record.tokens_refill_at) <= new Date()) {
-    const nextRefill = nextISTResetTime(new Date()).toISOString();
+    const nextRefill = nextRefillTime(record.refill_interval || "5h");
     await env.claudemax_v4db.prepare(
       "UPDATE api_keys SET tokens_used = 0, input_tokens = 0, output_tokens = 0, cache_tokens = 0, tokens_refill_at = ? WHERE api_key = ?"
     ).bind(nextRefill, apiKey).run();
@@ -380,6 +394,7 @@ async function handleAdmin(request, env, adminSecret) {
       cacheTokens: r.cache_tokens ?? 0,
       hasRefill: !!r.has_refill,
       tokensRefillAt: r.tokens_refill_at ?? null,
+      refillInterval: r.refill_interval ?? "5h",
     }));
     return json({ keys });
   }
@@ -390,6 +405,7 @@ async function handleAdmin(request, env, adminSecret) {
     const name = (body.name || "api-key").slice(0, 50);
     const tokenLimit = Math.max(0, parseInt(body.tokenLimit) || 0);
     const hasRefill = body.enableRefill === true;
+    const refillInterval = ["5h", "daily"].includes(body.refillInterval) ? body.refillInterval : "5h";
     const apiKey = generateKey(32);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + days * 86400000);
@@ -399,6 +415,7 @@ async function handleAdmin(request, env, adminSecret) {
       expiresAt: expiresAt.toISOString(),
       tokenLimit,
       hasRefill,
+      refillInterval,
     };
     await putKey(env, apiKey, record);
     return json({
@@ -439,11 +456,12 @@ async function handleAdmin(request, env, adminSecret) {
     const body = await request.json().catch(() => ({}));
     if (!body.apiKey) return json({ error: "apiKey required" }, 400);
     const enable = body.enable === true;
-    const refillAt = enable ? nextISTResetTime(new Date()).toISOString() : null;
+    const interval = ["5h", "daily"].includes(body.refillInterval) ? body.refillInterval : "5h";
+    const refillAt = enable ? nextRefillTime(interval) : null;
     await env.claudemax_v4db.prepare(
-      "UPDATE api_keys SET has_refill = ?, tokens_refill_at = ? WHERE api_key = ?"
-    ).bind(enable ? 1 : 0, refillAt, body.apiKey).run();
-    return json({ ok: true, tokensRefillAt: refillAt });
+      "UPDATE api_keys SET has_refill = ?, tokens_refill_at = ?, refill_interval = ? WHERE api_key = ?"
+    ).bind(enable ? 1 : 0, refillAt, interval, body.apiKey).run();
+    return json({ ok: true, tokensRefillAt: refillAt, refillInterval: interval });
   }
 
   if (request.method === "POST" && path === "/admin/migrate") {
@@ -453,6 +471,7 @@ async function handleAdmin(request, env, adminSecret) {
       "ALTER TABLE api_keys ADD COLUMN cache_tokens INTEGER DEFAULT 0",
       "ALTER TABLE api_keys ADD COLUMN has_refill INTEGER DEFAULT 0",
       "ALTER TABLE api_keys ADD COLUMN tokens_refill_at TEXT",
+      "ALTER TABLE api_keys ADD COLUMN refill_interval TEXT DEFAULT '5h'",
     ];
     const results = [];
     for (const sql of alters) {
